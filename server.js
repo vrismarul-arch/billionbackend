@@ -18,9 +18,8 @@ const app = express();
 
 /* ⭐ CORS — supports Web + Expo Mobile */
 const allowedOrigins = [
-  "https://vrismcrm.netlify.app",
   "http://localhost:5173",
-  "https://crm.vrismcloud.com",
+  "https://cloudcrm.billioncreators.in",
   "http://localhost:8081",
   "http://localhost:19006",
 ];

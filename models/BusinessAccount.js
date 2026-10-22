@@ -33,6 +33,26 @@ const followUpSchema = new mongoose.Schema(
   { _id: false }
 );
 
+// ✅ NEW: one row per selected service
+const accountServiceSchema = new mongoose.Schema(
+  {
+    service: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "BrandService",
+      required: true,
+    },
+    plan: { type: mongoose.Schema.Types.ObjectId, default: null },
+    billingCycle: {
+      type: String,
+      enum: ["Monthly", "Yearly", "One Time"],
+      default: "Monthly",
+    },
+    gstRate: { type: Number, default: 18 },
+    price: { type: Number, default: 0 }, // price incl. GST for this row
+  },
+  { _id: false }
+);
+
 const businessAccountSchema = new mongoose.Schema(
   {
     businessName: {
@@ -70,7 +90,12 @@ const businessAccountSchema = new mongoose.Schema(
     pincode: Number,
     website: String,
 
-    typeOfLead: [{ type: String, enum: ['Fixed client', 'Revenue based client', 'Vrism Product',"others"] }],
+    typeOfLead: [
+      {
+        type: String,
+        enum: ["Fixed client", "Revenue based client", "Vrism Product", "others"],
+      },
+    ],
 
     status: {
       type: String,
@@ -89,6 +114,11 @@ const businessAccountSchema = new mongoose.Schema(
 
     assignedTo: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
 
+    // ✅ NEW: multiple services
+    services: [accountServiceSchema],
+
+    // ⚠️ LEGACY (kept so old screens don't break).
+    // The controller keeps these in sync with services[0].
     selectedService: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "BrandService",
@@ -101,10 +131,11 @@ const businessAccountSchema = new mongoose.Schema(
 
     billingCycle: {
       type: String,
-      enum: ["Monthly", "Yearly","One Time"],
+      enum: ["Monthly", "Yearly", "One Time"],
       default: "Monthly",
     },
 
+    // Sum of all services (incl. GST)
     totalPrice: { type: Number, default: 0 },
 
     gstRate: { type: Number, default: 18 },

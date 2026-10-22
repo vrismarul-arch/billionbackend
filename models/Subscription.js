@@ -1,3 +1,5 @@
+// File: models/Subscription.js
+
 const mongoose = require("mongoose");
 
 const subscriptionHistorySchema = new mongoose.Schema(
@@ -24,14 +26,21 @@ const subscriptionSchema = new mongoose.Schema(
       required: true,
     },
 
-    // ⭐ Stored as plain value (NOT ref)
+    // ✅ NEW: store the plan subdoc id so we can round-trip it
+    currentPlan: {
+      type: mongoose.Schema.Types.ObjectId,
+      default: null,
+    },
+
+    // Snapshot fields (kept so historical/plan changes remain visible)
     planName: { type: String, required: true },
     planPriceMonthly: Number,
     planPriceYearly: Number,
+    planPriceOneTime: Number, // ✅ add this (used by One Time plans)
 
     billingCycle: {
       type: String,
-      enum: ["Monthly", "Yearly","One Time"],
+      enum: ["Monthly", "Yearly", "One Time"],
       default: "Monthly",
     },
 
@@ -45,7 +54,7 @@ const subscriptionSchema = new mongoose.Schema(
 
     status: {
       type: String,
-      enum: ["active", "expired", "cancelled", "pending","lifetime"],
+      enum: ["active", "expired", "cancelled", "pending", "lifetime"],
       default: "active",
     },
     autoRenew: { type: Boolean, default: true },

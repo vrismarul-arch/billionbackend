@@ -10,13 +10,18 @@ const mongoose = require("mongoose");
 const populateOptions = [
   { path: "assignedTo", select: "name role" },
   { path: "followUps.addedBy", select: "name" },
+  // ✅ NEW: multiple services
   {
-    path: "selectedService",
-    select: "serviceName basePrice gstRate plans", // basePrice + plans used for pricing
+    path: "services.service",
+    select: "serviceName basePrice gstRate plans",
     model: "BrandService",
   },
-  // If you later change selectedPlan to a proper ref, you can add:
-  // { path: "selectedPlan", select: "name priceMonthly priceYearly" }
+  // ⚠️ LEGACY single service (kept for old screens)
+  {
+    path: "selectedService",
+    select: "serviceName basePrice gstRate plans",
+    model: "BrandService",
+  },
 ];
 
 // ✅ Small helper to normalize GST with default 18%
@@ -27,6 +32,10 @@ const getEffectiveGstRate = (gstValue) => {
   return num;
 };
 
+const escapeRegex = (str = "") => String(str).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+const toId = (value) => value?._id || value || null;
+
 // Helper to calculate price with GST based on service + plan + billingCycle
 const calculateTotalPrice = (service, planId, billingCycle = "Monthly") => {
   if (!service) return 0;
@@ -34,12 +43,12 @@ const calculateTotalPrice = (service, planId, billingCycle = "Monthly") => {
   let base = 0;
 
   // Try to use a plan if given
-  if (planId && service.plans && service.plans.length > 0) {
+  if (planId && mongoose.Types.ObjectId.isValid(planId) && service.plans?.length > 0) {
     const plan = service.plans.id(planId);
     if (plan) {
       if (billingCycle === "Monthly") base = plan.priceMonthly || 0;
       else if (billingCycle === "Yearly") base = plan.priceYearly || 0;
-      else if (billingCycle === "One Time") base = plan.priceOneTime || 0; // ⭐ added
+      else if (billingCycle === "One Time") base = plan.priceOneTime || 0;
     }
   }
 
@@ -48,13 +57,90 @@ const calculateTotalPrice = (service, planId, billingCycle = "Monthly") => {
     base = service.basePrice;
   }
 
-  // ❗ Use normalized GST with default 18%
   const gstRate = getEffectiveGstRate(service.gstRate);
-
   const gstAmount = (base * gstRate) / 100;
-  const total = base + gstAmount;
 
-  return Math.round(total); // rounded final total
+  return Math.round(base + gstAmount);
+};
+
+// =========================
+// MULTI-SERVICE HELPERS
+// =========================
+
+// Read the raw services list from a request body.
+// - new clients send  services: [...]
+// - old clients send  selectedService / selectedPlan / billingCycle
+// Returns null when the request says nothing about services.
+const resolveRawServices = (body) => {
+  if (Array.isArray(body.services)) return body.services;
+
+  if (body.selectedService) {
+    return [
+      {
+        service: body.selectedService,
+        plan: body.selectedPlan,
+        billingCycle: body.billingCycle,
+      },
+    ];
+  }
+
+  return null;
+};
+
+// Validate rows, load services from DB and calculate every price on the server
+// (we never trust the price sent by the browser).
+const buildServices = async (rawServices = []) => {
+  const rows = rawServices.filter((r) => {
+    const id = toId(r?.service);
+    return id && mongoose.Types.ObjectId.isValid(id);
+  });
+
+  if (rows.length === 0) return { services: [], totalPrice: 0 };
+
+  const ids = rows.map((r) => toId(r.service));
+  const found = await BrandService.find({ _id: { $in: ids } });
+  const byId = new Map(found.map((s) => [String(s._id), s]));
+
+  let totalPrice = 0;
+  const services = [];
+
+  for (const row of rows) {
+    const srv = byId.get(String(toId(row.service)));
+    if (!srv) continue; // unknown service id → skip
+
+    const planId = toId(row.plan);
+    const billingCycle = ["Monthly", "Yearly", "One Time"].includes(row.billingCycle)
+      ? row.billingCycle
+      : "Monthly";
+
+    const price = calculateTotalPrice(srv, planId, billingCycle);
+    totalPrice += price;
+
+    services.push({
+      service: srv._id,
+      plan: planId && mongoose.Types.ObjectId.isValid(planId) ? planId : null,
+      billingCycle,
+      gstRate: getEffectiveGstRate(srv.gstRate),
+      price,
+    });
+  }
+
+  return { services, totalPrice };
+};
+
+// Writes services + totals (+ legacy single-service fields) onto `target`
+const applyServices = async (target, rawServices) => {
+  const { services, totalPrice } = await buildServices(rawServices);
+  const first = services[0];
+
+  target.services = services;
+  target.totalPrice = totalPrice;
+
+  // Keep legacy fields in sync with the first service
+  target.selectedService = first ? first.service : null;
+  target.selectedPlan = first ? first.plan : null;
+  target.billingCycle = first ? first.billingCycle : "Monthly";
+  target.gstRate = first ? first.gstRate : 18;
 };
 
 // =========================
@@ -105,8 +191,8 @@ exports.getPaginatedAccounts = async (req, res) => {
 
     if (search) {
       query.$or = [
-        { businessName: { $regex: search, $options: "i" } },
-        { contactName: { $regex: search, $options: "i" } },
+        { businessName: { $regex: escapeRegex(search), $options: "i" } },
+        { contactName: { $regex: escapeRegex(search), $options: "i" } },
       ];
     }
 
@@ -141,9 +227,7 @@ exports.getAccountCounts = async (req, res) => {
 
     // user/role filter
     if (req.query.role === "Employee" && req.query.userId) {
-      matchQuery.assignedTo = new mongoose.Types.ObjectId(
-        req.query.userId
-      );
+      matchQuery.assignedTo = new mongoose.Types.ObjectId(req.query.userId);
     }
 
     const counts = await BusinessAccount.aggregate([
@@ -151,30 +235,12 @@ exports.getAccountCounts = async (req, res) => {
       {
         $facet: {
           all: [{ $count: "total" }],
-          active: [
-            { $match: { status: "Active" } },
-            { $count: "total" },
-          ],
-          Pipeline: [
-            { $match: { status: "Pipeline" } },
-            { $count: "total" },
-          ],
-          quotations: [
-            { $match: { status: "Quotations" } },
-            { $count: "total" },
-          ],
-          customers: [
-            { $match: { status: "Customer" } },
-            { $count: "total" },
-          ],
-          closed: [
-            { $match: { status: "Closed" } },
-            { $count: "total" },
-          ],
-          targetLeads: [
-            { $match: { status: "TargetLeads" } },
-            { $count: "total" },
-          ],
+          active: [{ $match: { status: "Active" } }, { $count: "total" }],
+          Pipeline: [{ $match: { status: "Pipeline" } }, { $count: "total" }],
+          quotations: [{ $match: { status: "Quotations" } }, { $count: "total" }],
+          customers: [{ $match: { status: "Customer" } }, { $count: "total" }],
+          closed: [{ $match: { status: "Closed" } }, { $count: "total" }],
+          targetLeads: [{ $match: { status: "TargetLeads" } }, { $count: "total" }],
         },
       },
       {
@@ -185,9 +251,7 @@ exports.getAccountCounts = async (req, res) => {
           quotations: { $arrayElemAt: ["$quotations.total", 0] },
           customers: { $arrayElemAt: ["$customers.total", 0] },
           closed: { $arrayElemAt: ["$closed.total", 0] },
-          targetLeads: {
-            $arrayElemAt: ["$targetLeads.total", 0],
-          },
+          targetLeads: { $arrayElemAt: ["$targetLeads.total", 0] },
         },
       },
     ]);
@@ -264,8 +328,9 @@ exports.getCustomers = async (req, res) => {
 // =========================
 exports.getAccountById = async (req, res) => {
   try {
-    const account = await BusinessAccount.findById(req.params.id)
-      .populate(populateOptions);
+    const account = await BusinessAccount.findById(req.params.id).populate(
+      populateOptions
+    );
 
     if (!account) {
       return res.status(404).json({ message: "Account not found" });
@@ -293,13 +358,11 @@ exports.getAccountById = async (req, res) => {
     };
 
     res.json(formatted);
-
   } catch (err) {
     console.error("getAccountById error:", err);
     res.status(500).json({ error: err.message });
   }
 };
-
 
 // =========================
 // CREATE account
@@ -311,16 +374,15 @@ exports.create = async (req, res) => {
     // Duplicate businessName (case-insensitive)
     const existingAccount = await BusinessAccount.findOne({
       businessName: {
-        $regex: new RegExp(`^${data.businessName}$`, "i"),
+        $regex: new RegExp(`^${escapeRegex(data.businessName)}$`, "i"),
       },
     }).populate("assignedTo", "name role");
 
     if (existingAccount) {
       return res.status(409).json({
-        message:
-          existingAccount.assignedTo
-            ? `An account with this business name already exists. It is currently assigned to ${existingAccount.assignedTo.name}.`
-            : `An account with this business name already exists.`,
+        message: existingAccount.assignedTo
+          ? `An account with this business name already exists. It is currently assigned to ${existingAccount.assignedTo.name}.`
+          : `An account with this business name already exists.`,
         existingAccount: existingAccount._id,
         assignedTo: existingAccount.assignedTo
           ? {
@@ -334,20 +396,10 @@ exports.create = async (req, res) => {
     // Status → isCustomer
     data.isCustomer = data.status === "Customer";
 
-    // Pricing: selectedService + selectedPlan + billingCycle
-    if (data.selectedService) {
-      const service = await BrandService.findById(data.selectedService);
-
-      if (service) {
-        // ✅ Store effective GST (service.gstRate or 18%)
-        data.gstRate = getEffectiveGstRate(service.gstRate);
-
-        data.totalPrice = calculateTotalPrice(
-          service,
-          data.selectedPlan,
-          data.billingCycle || "Monthly"
-        );
-      }
+    // ✅ Pricing: multiple services (or legacy single service)
+    const rawServices = resolveRawServices(data);
+    if (rawServices) {
+      await applyServices(data, rawServices);
     }
 
     const newAccount = new BusinessAccount(data);
@@ -385,7 +437,7 @@ exports.update = async (req, res) => {
       return res.status(404).json({ message: "Account not found" });
     }
 
-    // Merge old + new for pricing calc
+    // Merge old + new
     const merged = {
       ...existing.toObject(),
       ...data,
@@ -394,19 +446,11 @@ exports.update = async (req, res) => {
 
     merged.isCustomer = merged.status === "Customer";
 
-    // Pricing logic
-    if (merged.selectedService) {
-      const service = await BrandService.findById(merged.selectedService);
-      if (service) {
-        // ✅ Store effective GST again on update
-        merged.gstRate = getEffectiveGstRate(service.gstRate);
-
-        merged.totalPrice = calculateTotalPrice(
-          service,
-          merged.selectedPlan,
-          merged.billingCycle || "Monthly"
-        );
-      }
+    // ✅ Pricing: only recalculate when the request includes services
+    // (otherwise keep what is already stored)
+    const rawServices = resolveRawServices(data);
+    if (rawServices) {
+      await applyServices(merged, rawServices);
     }
 
     const updated = await BusinessAccount.findByIdAndUpdate(
@@ -501,9 +545,7 @@ exports.addQuotation = async (req, res) => {
 };
 
 exports.getQuotations = async (req, res) => {
-  res
-    .status(501)
-    .json({ message: "Get quotations not implemented yet." });
+  res.status(501).json({ message: "Get quotations not implemented yet." });
 };
 
 // =========================
@@ -567,11 +609,7 @@ exports.updateFollowUp = async (req, res) => {
     const account = await BusinessAccount.findById(id);
     const followUpIndex = parseInt(index);
 
-    if (
-      !account ||
-      isNaN(followUpIndex) ||
-      !account.followUps[followUpIndex]
-    ) {
+    if (!account || isNaN(followUpIndex) || !account.followUps[followUpIndex]) {
       return res.status(404).json({ message: "Follow-up not found" });
     }
 
@@ -602,11 +640,7 @@ exports.deleteFollowUp = async (req, res) => {
     const account = await BusinessAccount.findById(id);
     const followUpIndex = parseInt(index);
 
-    if (
-      !account ||
-      isNaN(followUpIndex) ||
-      !account.followUps[followUpIndex]
-    ) {
+    if (!account || isNaN(followUpIndex) || !account.followUps[followUpIndex]) {
       return res.status(404).json({ message: "Follow-up not found" });
     }
 

@@ -1,22 +1,20 @@
-// server.js (FINAL WORKING)
-// CHAT + PRESENCE + LEAVE + SOCKET LIVE REFRESH + CRON 
 
 require("dotenv").config();
+
 const express = require("express");
 const cors = require("cors");
 const http = require("http");
 const { Server } = require("socket.io");
 const cron = require("node-cron");
-const connectDB = require("./config/db");
 
-// Auto Overtime Cron
+const connectDB = require("./config/db");
 const checkOvertimeAlerts = require("./utils/workOvertimeChecker");
 const checkRenewalAlerts = require("./utils/subscriptionRenewalReminder");
 const User = require("./models/User");
 
 const app = express();
 
-/* ⭐ CORS — supports Web + Expo Mobile */
+/* CORS */
 const allowedOrigins = [
   "http://localhost:5173",
   "https://cloudcrm.billioncreators.in",
@@ -24,20 +22,22 @@ const allowedOrigins = [
   "http://localhost:19006",
 ];
 
+const isAllowedOrigin = (origin) => {
+  if (!origin || allowedOrigins.includes(origin)) {
+    return true;
+  }
+
+  // Expo development URLs, for example exp://192.168.1.10:8081
+  return /^exp:\/\/\d{1,3}(?:\.\d{1,3}){3}(?::\d+)?$/.test(origin);
+};
+
 const corsOptions = {
-  origin: function (origin, callback) {
-    // ✅ Allow: no origin (native mobile / Postman)
-    // ✅ Allow: whitelisted origins
-    // ✅ Allow: Expo LAN — exp://192.168.x.x:xxxx
-    if (
-      !origin ||
-      allowedOrigins.includes(origin) ||
-      /^exp:\/\/192\.168\.\d+\.\d+/.test(origin)
-    ) {
-      callback(null, true);
-    } else {
-      callback(new Error("Not allowed by CORS: " + origin));
+  origin: (origin, callback) => {
+    if (isAllowedOrigin(origin)) {
+      return callback(null, true);
     }
+
+    return callback(new Error("Not allowed by CORS: " + origin));
   },
   credentials: true,
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
@@ -45,9 +45,22 @@ const corsOptions = {
 };
 
 app.use(cors(corsOptions));
-app.use(express.json());
 
-// ⭐ API ROUTES
+/* RAZORPAY WEBHOOK
+   IMPORTANT: Register before express.json().
+   Razorpay signature verification needs the original raw body.
+*/
+app.post(
+  "/api/invoices/webhook",
+  express.raw({ type: "application/json" }),
+  require("./controllers/invoiceController").razorpayWebhook
+);
+
+/* BODY PARSERS */
+app.use(express.json({ limit: "20mb" }));
+app.use(express.urlencoded({ extended: true, limit: "20mb" }));
+
+/* API ROUTES */
 app.use("/api/events", require("./routes/eventRoutes"));
 app.use("/api/auth", require("./routes/authRoutes"));
 app.use("/api/departments", require("./routes/departmentRoutes"));
@@ -72,41 +85,40 @@ app.use("/api/steps", require("./routes/processStepRoutes"));
 app.use("/api/reports", require("./routes/weeklyReportRoutes"));
 app.use("/api/public-holidays", require("./routes/publicHolidayRoutes"));
 
-app.get("/api/test", (req, res) => res.json({ message: "Server OK 🚀" }));
-
-/* =====================================================
-      CRON JOBS
-===================================================== */
-
-// ⏳ Overtime Check Every 10 Mins
-cron.schedule("*/10 * * * *", () => {
-  console.log("CRON --> Checking Overtime...");
-  checkOvertimeAlerts();
+app.get("/api/test", (req, res) => {
+  res.json({ message: "Server OK 🚀" });
 });
 
-// 🔥 Subscription Renewal Reminder Everyday Midnight
-cron.schedule("0 0 * * *", () => {
-  console.log("CRON --> Checking Subscription Renewals...");
-  checkRenewalAlerts();
+/* CRON JOBS */
+cron.schedule("*/10 * * * *", async () => {
+  try {
+    console.log("CRON --> Checking Overtime...");
+    await checkOvertimeAlerts();
+  } catch (error) {
+    console.error("Overtime cron error:", error);
+  }
 });
 
-/* =====================================================
-      SOCKET.IO SERVER
-===================================================== */
+cron.schedule("0 0 * * *", async () => {
+  try {
+    console.log("CRON --> Checking Subscription Renewals...");
+    await checkRenewalAlerts();
+  } catch (error) {
+    console.error("Subscription renewal cron error:", error);
+  }
+});
+
+/* SOCKET.IO */
 const httpServer = http.createServer(app);
 
 const io = new Server(httpServer, {
   cors: {
-    origin: function (origin, callback) {
-      if (
-        !origin ||
-        allowedOrigins.includes(origin) ||
-        /^exp:\/\/192\.168\.\d+\.\d+/.test(origin)
-      ) {
-        callback(null, true);
-      } else {
-        callback(new Error("Socket CORS blocked: " + origin));
+    origin: (origin, callback) => {
+      if (isAllowedOrigin(origin)) {
+        return callback(null, true);
       }
+
+      return callback(new Error("Socket CORS blocked: " + origin));
     },
     methods: ["GET", "POST"],
     credentials: true,
@@ -118,39 +130,40 @@ global._io = io;
 io.on("connection", (socket) => {
   console.log("🟢 Socket Connected:", socket.id);
 
-  // Employee joins personal socket room
   socket.on("join_room", (userId) => {
     if (userId) {
       socket.join(userId.toString());
-      console.log(`📌 joined room ${userId}`);
+      console.log(`📌 Joined room ${userId}`);
     }
   });
 
-  // REAL-TIME CHAT
   socket.on("send_message", (msg) => {
     if (!msg?.to) return;
+
     io.to(msg.to.toString()).emit("new_message", msg);
   });
 
-  // Real-time typing
-  socket.on("typing", ({ from, to }) => {
+  socket.on("typing", ({ from, to } = {}) => {
     if (!to) return;
+
     io.to(to.toString()).emit("typing", { from });
   });
 
-  // PRESENCE UPDATE
-  socket.on("presence_change", async ({ userId, presence }) => {
+  socket.on("presence_change", async ({ userId, presence } = {}) => {
     if (!userId) return;
 
-    await User.findByIdAndUpdate(userId, {
-      presence,
-      lastActiveAt: new Date(),
-    });
+    try {
+      await User.findByIdAndUpdate(userId, {
+        presence,
+        lastActiveAt: new Date(),
+      });
 
-    io.emit("presence_updated", { userId, presence });
+      io.emit("presence_updated", { userId, presence });
+    } catch (error) {
+      console.error("Presence update error:", error);
+    }
   });
 
-  // ⭐ LEAVE LIVE REFRESH
   socket.on("leave_applied", () => {
     io.emit("leave_list_refresh");
   });
@@ -165,9 +178,15 @@ io.on("connection", (socket) => {
 });
 
 /* START SERVER */
-connectDB().then(() => {
-  const PORT = process.env.PORT || 1001;
-  httpServer.listen(PORT, () =>
-    console.log(`🔥 API + SOCKET running on PORT ${PORT}`)
-  );
-});
+connectDB()
+  .then(() => {
+    const PORT = process.env.PORT || 1001;
+
+    httpServer.listen(PORT, () => {
+      console.log(`🔥 API + SOCKET running on PORT ${PORT}`);
+    });
+  })
+  .catch((error) => {
+    console.error("Database connection failed:", error);
+    process.exit(1);
+  });

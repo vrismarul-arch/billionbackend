@@ -1,363 +1,771 @@
-const Invoice = require('../models/Invoice');
-const BusinessAccount = require('../models/BusinessAccount');
 
-// GET all invoices
-exports.getAll = async (req, res) => {
+const mongoose = require("mongoose");
+const crypto = require("crypto");
+const Razorpay = require("razorpay");
+
+const Subscription = require("../models/Subscription");
+const InvoiceLog = require("../models/InvoiceLog");
+const InvoiceCounter = require("../models/InvoiceCounter");
+const { sendMail } = require("../utils/mailer");
+
+const razorpay = new Razorpay({
+  key_id: process.env.RAZORPAY_KEY_ID,
+  key_secret: process.env.RAZORPAY_KEY_SECRET,
+});
+
+// --------------------------------------------------
+// HELPERS
+// --------------------------------------------------
+
+const getCustomerEmail = (customer) => {
+  const email = customer?.contactEmail || customer?.email;
+  return typeof email === "string" ? email.trim() : "";
+};
+
+const isValidEmail = (email) =>
+  /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+
+const getCustomerDetails = (subscription) => {
+  const customer = subscription.businessAccount;
+
+  return {
+    customer,
+    name:
+      customer?.contactName ||
+      customer?.businessName ||
+      "Customer",
+    email: getCustomerEmail(customer),
+    contact: customer?.contactNumber || "",
+  };
+};
+
+const escapeHtml = (value) =>
+  String(value ?? "").replace(/[&<>"']/g, (char) => {
+    const entities = {
+      "&": "&amp;",
+      "<": "&lt;",
+      ">": "&gt;",
+      '"': "&quot;",
+      "'": "&#39;",
+    };
+
+    return entities[char];
+  });
+
+const formatAmount = (amount) =>
+  Number(amount).toLocaleString("en-IN", {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  });
+
+const populateSubscription = (id) =>
+  Subscription.findById(id)
+    .populate(
+      "businessAccount",
+      "businessName contactName contactNumber contactEmail email"
+    )
+    .populate("service");
+
+const writeInvoiceLog = async (data) => {
   try {
-    // Fetch only 'Invoice' type documents
-    const invoices = await Invoice.find({ invoiceType: 'Invoice' })
-      .populate('businessId')
-      .sort({ createdAt: -1 });
-    res.json(invoices);
-  } catch (err) {
-    console.error("Error in getAll invoices:", err);
-    res.status(500).json({ error: 'Failed to fetch invoices' });
+    await InvoiceLog.create(data);
+  } catch (error) {
+    console.error("Invoice log error:", error.message);
   }
 };
 
-// POST create a new invoice
-exports.create = async (req, res) => {
-  try {
-    const { items, taxRate = 18, discountAmount = 0, ...rest } = req.body; // invoiceType is now fixed to 'Invoice'
-    let nextNumber;
-    let invoiceFields = {};
+// --------------------------------------------------
+// SEQUENTIAL INVOICE NUMBER GENERATOR
+// BILL001, BILL002, BILL003...
+//
+// Counter resets to zero after invoice deletion.
+// Existing numbers are checked to prevent reuse.
+// --------------------------------------------------
 
-    // Generate invoice number for 'Invoice' type only
-    const lastInvoice = await Invoice.findOne({ invoiceType: 'Invoice' }).sort({ createdAt: -1 });
-    nextNumber = lastInvoice?.invoiceNumber
-      ? `INV-${String(parseInt(lastInvoice.invoiceNumber.split('-')[1]) + 1).padStart(4, '0')}`
-      : 'INV-0001';
-    invoiceFields.invoiceNumber = nextNumber;
+const getInvoiceNumber = async () => {
+  for (let attempt = 0; attempt < 10000; attempt++) {
+    const counter = await InvoiceCounter.findOneAndUpdate(
+      { _id: "invoice" },
+      { $inc: { sequence: 1 } },
+      {
+        new: true,
+        upsert: true,
+        setDefaultsOnInsert: true,
+      }
+    );
 
-    const calculatedItems = items || [];
-    const subTotal = calculatedItems.reduce((sum, item) => sum + (item.quantity * item.rate), 0);
-    const tax = subTotal * (taxRate / 100);
-    const totalAmount = subTotal + tax - discountAmount;
+    const candidate =
+      `BILL${String(counter.sequence).padStart(3, "0")}`;
 
-    const invoice = new Invoice({
-      ...rest,
-      ...invoiceFields,
-      invoiceType: 'Invoice', // Hardcode invoiceType to 'Invoice'
-      items: calculatedItems,
-      subTotal,
-      tax,
-      taxRate,
-      discountAmount,
-      totalAmount,
-      businessName: req.body.businessName,
-      customerName: req.body.customerName,
-      customerAddress: req.body.customerAddress,
-      customerGSTIN: req.body.customerGSTIN,
-      companyGSTIN: req.body.companyGSTIN,
-      companyName: req.body.companyName,
-      companyAddress: req.body.companyAddress,
-      contactPerson: req.body.contactPerson,
-      contactNumber: req.body.contactNumber,
-      paymentTerms: req.body.paymentTerms,
-      // NEW FIELDS: Add contactName, email, mobileNumber
-      contactName: req.body.contactName,
-      email: req.body.email,
-      mobileNumber: req.body.mobileNumber,
+    // Never reuse a number still assigned to an invoice.
+    const existing = await Subscription.exists({
+      invoiceNo: candidate,
     });
 
-    const saved = await invoice.save();
-    res.status(201).json(saved);
-  } catch (err) {
-    console.error("Error creating invoice:", err);
-    res.status(400).json({ error: err.message });
-  }
-};
-
-// Removed getInvoiceTypes, convertToInvoice, updateProformaStatus as Proforma is removed.
-
-// PATCH: Add payment to invoice with validation
-exports.addPayment = async (req, res) => {
-  try {
-    const { amount, method, reference, date, addedBy } = req.body;
-    const paymentAmount = parseFloat(amount);
-
-    if (isNaN(paymentAmount) || paymentAmount <= 0) {
-      return res.status(400).json({ error: 'Invalid payment amount. Must be a positive number.' });
+    if (!existing) {
+      return candidate;
     }
-
-    const invoice = await Invoice.findById(req.params.id);
-    if (!invoice) {
-      return res.status(404).json({ error: 'Invoice not found' });
-    }
-
-    const currentTotalPaid = invoice.paymentHistory.reduce((sum, p) => sum + p.amount, 0);
-    const invoiceTotal = invoice.totalAmount || 0;
-
-    if (currentTotalPaid + paymentAmount > invoiceTotal) {
-      return res.status(400).json({ error: 'Adding this payment would exceed the total invoice amount.' });
-    }
-
-    const payment = { amount: paymentAmount, method, reference, date, addedBy };
-
-    invoice.paymentHistory.push(payment);
-    await invoice.save();
-
-    res.json(invoice);
-  } catch (err) {
-    console.error("Error adding payment:", err);
-    res.status(400).json({ error: err.message });
   }
+
+  throw new Error("Unable to allocate a unique invoice number");
 };
 
-exports.getInvoiceById = async (req, res) => {
-  try {
-    const invoice = await Invoice.findById(req.params.id).populate('businessId');
-    if (!invoice) return res.status(404).json({ error: 'Invoice not found' });
-    res.json(invoice);
-  } catch (err) {
-    console.error("Error getting invoice by ID:", err);
-    res.status(500).json({ error: 'Failed to fetch invoice' });
-  }
-};
+// --------------------------------------------------
+// 1. PREPARE INVOICE + RAZORPAY PAYMENT LINK
+// POST /api/invoices/:id/prepare
+// --------------------------------------------------
 
-exports.updatePaymentHistory = async (req, res) => {
-  try {
-    const updated = await Invoice.findByIdAndUpdate(
-      req.params.id,
-      { paymentHistory: req.body.paymentHistory },
-      { new: true }
-    );
-    res.json(updated);
-  } catch (err) {
-    console.error("Error updating payment history:", err);
-    res.status(400).json({ error: err.message });
-  }
-};
-
-// PUT update invoice (blocked if isClosed is true)
-exports.update = async (req, res) => {
-  try {
-    const invoice = await Invoice.findById(req.params.id);
-    if (!invoice) return res.status(404).json({ error: 'Invoice not found' });
-    if (invoice.isClosed) return res.status(403).json({ error: 'Invoice is locked and cannot be edited' });
-
-    const { items, taxRate = 18, discountAmount = 0, ...rest } = req.body;
-
-    const calculatedItems = items || [];
-    const subTotal = calculatedItems.reduce((sum, item) => sum + (item.quantity * item.rate), 0);
-    const tax = subTotal * (taxRate / 100);
-    const totalAmount = subTotal + tax - discountAmount;
-
-    const updated = await Invoice.findByIdAndUpdate(
-      req.params.id,
-      {
-        ...rest,
-        items: calculatedItems,
-        subTotal,
-        tax,
-        taxRate,
-        discountAmount,
-        totalAmount,
-        businessName: req.body.businessName,
-        customerName: req.body.customerName,
-        customerAddress: req.body.customerAddress,
-        companyGSTIN: req.body.companyGSTIN,
-        companyName: req.body.companyName,
-        companyAddress: req.body.companyAddress,
-        contactPerson: req.body.contactPerson,
-        contactNumber: req.body.contactNumber,
-        paymentTerms: req.body.paymentTerms,
-        // NEW FIELDS: Update contactName, email, mobileNumber
-        contactName: req.body.contactName,
-        email: req.body.email,
-        mobileNumber: req.body.mobileNumber,
-      },
-      { new: true }
-    );
-
-    res.json(updated);
-  } catch (err) {
-    console.error("Error updating invoice:", err);
-    res.status(400).json({ error: err.message });
-  }
-};
-
-// DELETE invoice (blocked if isClosed is true)
-exports.remove = async (req, res) => {
-  try {
-    const invoice = await Invoice.findById(req.params.id);
-    if (!invoice) return res.status(404).json({ error: 'Invoice not found' });
-    if (invoice.isClosed) return res.status(403).json({ error: 'Invoice is locked and cannot be deleted' });
-
-    await Invoice.findByIdAndDelete(req.params.id);
-    res.json({ message: 'Deleted' });
-  } catch (err) {
-    console.error("Error removing invoice:", err);
-    res.status(400).json({ error: err.message });
-  }
-};
-
-// GET active businesses
-exports.getActiveBusinesses = async (req, res) => {
-  try {
-    const businesses = await BusinessAccount.find({ status: 'Active' });
-    res.json(businesses);
-  } catch (err) {
-    console.error("Error getting active businesses:", err);
-    res.status(500).json({ error: 'Failed to fetch businesses' });
-  }
-};
-
-// PATCH close invoice
-exports.closeInvoice = async (req, res) => {
-  try {
-    const updated = await Invoice.findByIdAndUpdate(
-      req.params.id,
-      { isClosed: true },
-      { new: true }
-    );
-    res.json(updated);
-  } catch (err) {
-    console.error("Error closing invoice:", err);
-    res.status(400).json({ error: err.message });
-  }
-};
-
-// PATCH unlock invoice
-exports.unlockInvoice = async (req, res) => {
-  try {
-    const updated = await Invoice.findByIdAndUpdate(
-      req.params.id,
-      { isClosed: false },
-      { new: true }
-    );
-    res.json(updated);
-  } catch (err) {
-    console.error("Error unlocking invoice:", err);
-    res.status(400).json({ error: err.message });
-  }
-};
-
-exports.getInvoicesByBusinessId = async (req, res) => {
-  try {
-    const invoices = await Invoice.find({ businessId: req.params.id });
-    res.json(invoices);
-  } catch (err) {
-    console.error("Error getting invoices by business ID:", err);
-    res.status(500).json({ message: 'Failed to fetch invoices' });
-  }
-};
-
-exports.getPaymentsByBusinessId = async (req, res) => {
-  try {
-    const invoices = await Invoice.find({ businessId: req.params.id });
-    const allPayments = invoices.flatMap(inv => inv.paymentHistory || []);
-    res.json(allPayments);
-  } catch (err) {
-    console.error("Error getting payments by business ID:", err);
-    res.status(500).json({ message: 'Failed to fetch payments' });
-  }
-};
-
-// Get follow-ups by invoice ID (changed from account ID)
-exports.getFollowUpsByInvoiceId = async (req, res) => {
-  try {
-    const invoice = await Invoice.findById(req.params.id)
-      .populate('followUps.addedBy', 'name email');
-
-    if (!invoice) return res.status(404).json({ message: 'Invoice not found' });
-
-    res.json(invoice.followUps || []);
-  } catch (err) {
-    console.error("Error fetching follow-ups by invoice ID:", err);
-    res.status(500).json({ message: 'Failed to fetch follow-ups', error: err.message });
-  }
-};
-
-// ADD a follow-up to an invoice
-exports.addFollowUp = async (req, res) => {
+exports.prepareInvoice = async (req, res) => {
   try {
     const { id } = req.params;
-    const { date, note, addedBy } = req.body;
 
-    if (!date || !note || !addedBy) {
-      return res.status(400).json({ message: 'Date, note, and addedBy are required.' });
+    if (!mongoose.isValidObjectId(id)) {
+      return res.status(400).json({
+        message: "Invalid subscription ID",
+      });
     }
 
-    const invoice = await Invoice.findById(id);
-    if (!invoice) return res.status(404).json({ message: 'Invoice not found.' });
+    const subscription = await populateSubscription(id);
 
-    invoice.followUps.push({ date, note, addedBy });
-    await invoice.save();
+    if (!subscription) {
+      return res.status(404).json({
+        message: "Subscription not found",
+      });
+    }
 
-    res.status(200).json({ message: 'Follow-up added', followUps: invoice.followUps });
+    const { customer, name, email, contact } =
+      getCustomerDetails(subscription);
+
+    if (!email || !isValidEmail(email)) {
+      return res.status(400).json({
+        message: "A valid customer email is required",
+      });
+    }
+
+    const totalAmount =
+      subscription.totalWithGST ?? subscription.amountPaid;
+
+    if (
+      !Number.isFinite(Number(totalAmount)) ||
+      Number(totalAmount) <= 0
+    ) {
+      return res.status(400).json({
+        message: "Invalid invoice amount",
+      });
+    }
+
+    if (!subscription.invoiceNo) {
+      subscription.invoiceNo = await getInvoiceNumber();
+    }
+
+    // Reuse the existing unpaid payment link.
+    if (
+      subscription.paymentLinkId &&
+      subscription.paymentLinkUrl &&
+      subscription.invoicePaymentStatus === "pending"
+    ) {
+      return res.status(200).json({
+        message: "Existing payment link retrieved",
+        subscriptionId: subscription._id,
+        invoiceNo: subscription.invoiceNo,
+        customerEmail: email,
+        amount: Number(totalAmount),
+        currency: "INR",
+        paymentLinkId: subscription.paymentLinkId,
+        paymentLinkUrl: subscription.paymentLinkUrl,
+        invoicePaymentStatus: subscription.invoicePaymentStatus,
+      });
+    }
+
+    const paymentLink = await razorpay.paymentLink.create({
+      amount: Math.round(Number(totalAmount) * 100),
+      currency: "INR",
+      accept_partial: false,
+      reference_id: String(subscription._id).slice(0, 40),
+      description: `Invoice ${subscription.invoiceNo}`,
+      customer: {
+        name,
+        email,
+        ...(contact
+          ? { contact: String(contact).replace(/\D/g, "") }
+          : {}),
+      },
+      notify: {
+        email: false,
+        sms: false,
+      },
+      reminder_enable: false,
+      notes: {
+        subscriptionId: String(subscription._id),
+        invoiceNo: subscription.invoiceNo,
+      },
+    });
+
+    subscription.paymentLinkId = paymentLink.id;
+    subscription.paymentLinkUrl = paymentLink.short_url;
+    subscription.invoicePaymentStatus = "pending";
+
+    await subscription.save();
+
+    await writeInvoiceLog({
+      subscription: subscription._id,
+      businessAccount: customer?._id,
+      invoiceNo: subscription.invoiceNo,
+      action: "payment_link_created",
+      amount: Number(totalAmount),
+      sentTo: email,
+      paymentLinkUrl: paymentLink.short_url,
+      note: "Razorpay payment link created",
+    });
+
+    return res.status(200).json({
+      message: "Invoice prepared successfully",
+      subscriptionId: subscription._id,
+      invoiceNo: subscription.invoiceNo,
+      customerEmail: email,
+      amount: Number(totalAmount),
+      currency: "INR",
+      paymentLinkId: paymentLink.id,
+      paymentLinkUrl: paymentLink.short_url,
+      invoicePaymentStatus: subscription.invoicePaymentStatus,
+    });
   } catch (error) {
-    console.error("Error adding follow-up:", error);
-    res.status(500).json({ message: 'Failed to add follow-up', error: error.message });
+    console.error("Prepare invoice error:", error);
+
+    return res.status(500).json({
+      message: "Failed to prepare invoice",
+      error: error.error?.description || error.message,
+    });
   }
 };
 
-// UPDATE follow-up by index on an invoice
-exports.updateFollowUp = async (req, res) => {
-  const { id, index } = req.params;
-  const { date, note, status } = req.body;
+// --------------------------------------------------
+// 2. SEND INVOICE PDF BY EMAIL
+// POST /api/invoices/:id/send
+// Body: { pdfBase64: "..." }
+// --------------------------------------------------
 
+exports.sendInvoice = async (req, res) => {
   try {
-    const invoice = await Invoice.findById(id);
-    if (!invoice || !invoice.followUps[index]) {
-      return res.status(404).json({ message: 'Follow-up not found.' });
+    const { id } = req.params;
+    const { pdfBase64 } = req.body || {};
+
+    if (!mongoose.isValidObjectId(id)) {
+      return res.status(400).json({
+        message: "Invalid subscription ID",
+      });
     }
 
-    invoice.followUps[index].date = date;
-    invoice.followUps[index].note = note;
-    invoice.followUps[index].status = status;
-    await invoice.save();
+    if (
+      typeof pdfBase64 !== "string" ||
+      !pdfBase64.trim()
+    ) {
+      return res.status(400).json({
+        message: "Invoice PDF is required",
+      });
+    }
 
-    res.status(200).json({ message: 'Follow-up updated', followUps: invoice.followUps });
+    const subscription = await populateSubscription(id);
+
+    if (!subscription) {
+      return res.status(404).json({
+        message: "Subscription not found",
+      });
+    }
+
+    const { customer, name, email } =
+      getCustomerDetails(subscription);
+
+    if (!email || !isValidEmail(email)) {
+      return res.status(400).json({
+        message: "A valid customer email is required",
+      });
+    }
+
+    if (!subscription.invoiceNo) {
+      subscription.invoiceNo = await getInvoiceNumber();
+    }
+
+    const cleanBase64 = pdfBase64
+      .replace(/^data:application\/pdf;base64,/i, "")
+      .replace(/\s/g, "");
+
+    const pdfBuffer = Buffer.from(cleanBase64, "base64");
+
+    if (
+      !pdfBuffer.length ||
+      pdfBuffer.subarray(0, 4).toString() !== "%PDF"
+    ) {
+      return res.status(400).json({
+        message: "Invalid PDF file",
+      });
+    }
+
+    const amount =
+      subscription.totalWithGST ??
+      subscription.amountPaid ??
+      0;
+
+    const paymentLink = subscription.paymentLinkUrl
+      ? `
+        <table role="presentation" cellspacing="0"
+               cellpadding="0" border="0"
+               style="margin:28px auto;">
+          <tr>
+            <td bgcolor="#111111" align="center"
+                style="border-radius:4px;">
+              <a href="${escapeHtml(subscription.paymentLinkUrl)}"
+                 style="display:inline-block;padding:15px 38px;
+                        color:#ffffff;text-decoration:none;
+                        font-family:Arial,sans-serif;font-size:13px;
+                        font-weight:bold;letter-spacing:1px;">
+                PAY INVOICE &nbsp; &#8594;
+              </a>
+            </td>
+          </tr>
+        </table>`
+      : `<p style="font-size:13px;color:#555555;">
+           Please contact our team for payment details.
+         </p>`;
+
+    const paymentContent =
+      subscription.invoicePaymentStatus === "paid"
+        ? `<p style="padding:15px;background:#f5f5f5;
+                     border:1px solid #dddddd;text-align:center;">
+             Payment received. Thank you!
+           </p>`
+        : paymentLink;
+
+    // Premium black-and-white responsive email.
+    const html = `
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <meta charset="UTF-8">
+        <meta name="viewport"
+              content="width=device-width, initial-scale=1.0">
+      </head>
+      <body style="margin:0;padding:0;background:#f3f3f3;
+                   font-family:Arial,Helvetica,sans-serif;color:#171717;">
+        <table role="presentation" width="100%" cellspacing="0"
+               cellpadding="0" style="background:#f3f3f3;">
+          <tr>
+            <td align="center" style="padding:30px 12px;">
+              <table role="presentation" width="600" cellspacing="0"
+                     cellpadding="0"
+                     style="width:100%;max-width:600px;background:#ffffff;">
+
+                <tr>
+                  <td style="background:#111111;padding:30px 36px;">
+                    <p style="margin:0;color:#cccccc;font-size:10px;
+                              letter-spacing:3px;font-weight:bold;">
+                      INVOICE NOTIFICATION
+                    </p>
+                    <h1 style="margin:18px 0 0;color:#ffffff;font-size:28px;">
+                      Invoice ${escapeHtml(subscription.invoiceNo)}
+                    </h1>
+                    <p style="color:#cccccc;font-size:12px;">
+                      Your invoice is ready for review.
+                    </p>
+                  </td>
+                </tr>
+
+                <tr>
+                  <td style="padding:35px 36px 25px;">
+                    <p style="font-size:15px;">
+                      Hello ${escapeHtml(name)},
+                    </p>
+                    <p style="font-size:13px;line-height:1.9;color:#555555;">
+                      Thank you for your business. Your invoice is
+                      attached as a PDF. Please review the summary
+                      and complete payment if it is still pending.
+                    </p>
+
+                    <table role="presentation" width="100%" cellspacing="0"
+                           cellpadding="0"
+                           style="border:1px solid #e5e5e5;">
+                      <tr>
+                        <td colspan="2"
+                            style="padding:15px;background:#f7f7f7;
+                                   font-size:11px;font-weight:bold;
+                                   letter-spacing:1.5px;">
+                          INVOICE SUMMARY
+                        </td>
+                      </tr>
+                      <tr>
+                        <td style="padding:18px;border-top:1px solid #eee;
+                                   font-size:12px;color:#666;">
+                          Invoice Number
+                        </td>
+                        <td align="right"
+                            style="padding:18px;border-top:1px solid #eee;
+                                   font-size:12px;font-weight:bold;">
+                          ${escapeHtml(subscription.invoiceNo)}
+                        </td>
+                      </tr>
+                      <tr>
+                        <td style="padding:18px;border-top:1px solid #eee;
+                                   font-size:12px;color:#666;">
+                          Invoice Amount
+                        </td>
+                        <td align="right"
+                            style="padding:18px;border-top:1px solid #eee;
+                                   font-size:19px;font-weight:bold;">
+                          &#8377;${formatAmount(amount)}
+                        </td>
+                      </tr>
+                      <tr>
+                        <td style="padding:18px;border-top:1px solid #eee;
+                                   font-size:12px;color:#666;">
+                          Payment Status
+                        </td>
+                        <td align="right"
+                            style="padding:18px;border-top:1px solid #eee;
+                                   font-size:11px;font-weight:bold;">
+                          ${subscription.invoicePaymentStatus === "paid"
+                            ? "PAID"
+                            : "PAYMENT PENDING"}
+                        </td>
+                      </tr>
+                    </table>
+
+                    <div style="padding-top:20px;text-align:center;">
+                      ${paymentContent}
+                    </div>
+
+                    <p style="font-size:12px;line-height:1.8;color:#555;">
+                      If you have any questions regarding this invoice,
+                      please contact our team.
+                    </p>
+                    <p style="font-size:13px;">Thank you for choosing us.</p>
+                  </td>
+                </tr>
+
+                <tr>
+                  <td style="padding:24px 36px;background:#f7f7f7;
+                             border-top:1px solid #e5e5e5;">
+                    <p style="font-size:11px;font-weight:bold;
+                              letter-spacing:1.5px;">
+                      THANK YOU FOR YOUR TRUST
+                    </p>
+                    <p style="font-size:11px;line-height:1.8;color:#777;">
+                      Your invoice is attached as a PDF.
+                      Please keep it for your records.
+                    </p>
+                    <p style="font-size:10px;color:#999;">
+                      This is an automated invoice notification.
+                    </p>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+        </table>
+      </body>
+      </html>`;
+
+    await sendMail({
+      to: email,
+      subject: `Invoice ${subscription.invoiceNo}`,
+      html,
+      attachments: [
+        {
+          filename: `${subscription.invoiceNo}.pdf`,
+          content: pdfBuffer,
+          contentType: "application/pdf",
+        },
+      ],
+    });
+
+    subscription.invoiceSentAt = new Date();
+    subscription.invoiceSentTo = email;
+
+    await subscription.save();
+
+    await writeInvoiceLog({
+      subscription: subscription._id,
+      businessAccount: customer?._id,
+      invoiceNo: subscription.invoiceNo,
+      action: "sent",
+      amount: Number(amount),
+      sentTo: email,
+      paymentLinkUrl: subscription.paymentLinkUrl || "",
+      note: "Invoice emailed to customer",
+    });
+
+    return res.status(200).json({
+      message: "Invoice sent successfully",
+      invoiceNo: subscription.invoiceNo,
+      sentTo: email,
+      invoiceSentAt: subscription.invoiceSentAt,
+      paymentLinkUrl: subscription.paymentLinkUrl,
+      invoicePaymentStatus: subscription.invoicePaymentStatus,
+    });
   } catch (error) {
-    console.error("Error updating follow-up:", error);
-    res.status(500).json({ message: 'Error updating follow-up', error: error.message });
+    console.error("Send invoice error:", error);
+
+    return res.status(500).json({
+      message: "Failed to send invoice",
+      error: error.message || "Internal server error",
+    });
   }
 };
 
-// DELETE follow-up by index on an invoice
-exports.deleteFollowUp = async (req, res) => {
-  const { id, index } = req.params;
+// --------------------------------------------------
+// 3. RAZORPAY WEBHOOK
+// POST /api/invoices/webhook
+// Requires raw request body.
+// --------------------------------------------------
 
+exports.razorpayWebhook = async (req, res) => {
   try {
-    const invoice = await Invoice.findById(id);
-    if (!invoice || !invoice.followUps[index]) {
-      return res.status(404).json({ message: 'Follow-up not found.' });
+    const webhookSecret = process.env.RAZORPAY_WEBHOOK_SECRET;
+    const signature = req.headers["x-razorpay-signature"];
+
+    if (!webhookSecret) {
+      return res.status(500).json({
+        message: "Webhook configuration error",
+      });
     }
 
-    invoice.followUps.splice(index, 1);
-    await invoice.save();
+    if (!signature || !Buffer.isBuffer(req.body)) {
+      return res.status(400).json({
+        message: "Invalid webhook request",
+      });
+    }
 
-    res.status(200).json({ message: 'Follow-up deleted', followUps: invoice.followUps });
+    const expectedSignature = crypto
+      .createHmac("sha256", webhookSecret)
+      .update(req.body)
+      .digest("hex");
+
+    const received = Buffer.from(String(signature), "hex");
+    const expected = Buffer.from(expectedSignature, "hex");
+
+    if (
+      received.length !== expected.length ||
+      !crypto.timingSafeEqual(received, expected)
+    ) {
+      return res.status(400).json({
+        message: "Invalid webhook signature",
+      });
+    }
+
+    const eventBody = JSON.parse(req.body.toString("utf8"));
+
+    if (eventBody.event !== "payment_link.paid") {
+      return res.status(200).json({
+        message: "Webhook event ignored",
+        event: eventBody.event,
+      });
+    }
+
+    const paymentLink =
+      eventBody.payload?.payment_link?.entity;
+
+    const payment = eventBody.payload?.payment?.entity;
+    const paymentLinkId = paymentLink?.id;
+
+    if (!paymentLinkId) {
+      return res.status(400).json({
+        message: "Payment link ID missing",
+      });
+    }
+
+    const subscription = await Subscription.findOne({
+      paymentLinkId,
+    });
+
+    if (!subscription) {
+      return res.status(200).json({
+        message: "No matching subscription found",
+      });
+    }
+
+    const expectedAmount = Math.round(
+      Number(
+        subscription.totalWithGST ??
+        subscription.amountPaid ??
+        0
+      ) * 100
+    );
+
+    const paidAmount = Number(
+      paymentLink.amount_paid ?? payment?.amount ?? 0
+    );
+
+    if (expectedAmount <= 0 || paidAmount < expectedAmount) {
+      return res.status(400).json({
+        message: "Paid amount does not match invoice amount",
+      });
+    }
+
+    if (subscription.invoicePaymentStatus !== "paid") {
+      subscription.invoicePaymentStatus = "paid";
+      subscription.paidAt = new Date();
+
+      if (payment?.id) {
+        subscription.paymentId = payment.id;
+      }
+
+      await subscription.save();
+
+      await writeInvoiceLog({
+        subscription: subscription._id,
+        businessAccount: subscription.businessAccount,
+        invoiceNo: subscription.invoiceNo,
+        action: "paid",
+        amount: expectedAmount / 100,
+        paymentLinkUrl: subscription.paymentLinkUrl || "",
+        note: "Razorpay payment confirmed by webhook",
+      });
+    }
+
+    return res.status(200).json({
+      message: "Payment status updated",
+      invoiceNo: subscription.invoiceNo,
+      invoicePaymentStatus: subscription.invoicePaymentStatus,
+    });
   } catch (error) {
-    console.error("Error deleting follow-up:", error);
-    res.status(500).json({ message: 'Error deleting follow-up', error: error.message });
+    console.error("Razorpay webhook error:", error);
+
+    return res.status(500).json({
+      message: "Webhook processing failed",
+    });
   }
 };
 
-// NEW: Delete a specific payment from an invoice's payment history
-exports.deletePayment = async (req, res) => {
+// --------------------------------------------------
+// 4. GET INVOICE HISTORY
+// GET /api/invoices/history/:id
+// --------------------------------------------------
+
+exports.getInvoiceHistory = async (req, res) => {
   try {
-    const { invoiceId, paymentId } = req.params;
+    const { id } = req.params;
 
-    const invoice = await Invoice.findById(invoiceId);
-    if (!invoice) {
-      return res.status(404).json({ error: 'Invoice not found' });
+    if (!mongoose.isValidObjectId(id)) {
+      return res.status(400).json({
+        message: "Invalid subscription ID",
+      });
     }
 
-    const paymentIndex = invoice.paymentHistory.findIndex(p => p._id.toString() === paymentId);
+    const subscription = await Subscription.findById(id);
 
-    if (paymentIndex === -1) {
-      return res.status(404).json({ error: 'Payment not found in this invoice' });
+    if (!subscription) {
+      return res.status(404).json({
+        message: "Subscription not found",
+      });
     }
 
-    invoice.paymentHistory.splice(paymentIndex, 1);
+    const history = await InvoiceLog.find({
+      subscription: subscription._id,
+    }).sort({ createdAt: -1 });
 
-    await invoice.save();
+    return res.status(200).json({
+      subscriptionId: subscription._id,
+      invoiceNo: subscription.invoiceNo,
+      invoicePaymentStatus: subscription.invoicePaymentStatus,
+      paymentLinkUrl: subscription.paymentLinkUrl,
+      invoiceSentTo: subscription.invoiceSentTo,
+      invoiceSentAt: subscription.invoiceSentAt,
+      paidAt: subscription.paidAt,
+      history,
+    });
+  } catch (error) {
+    console.error("Invoice history error:", error);
 
-    res.json({ message: 'Payment deleted successfully', invoice });
-  } catch (err) {
-    console.error("Error deleting payment:", err);
-    res.status(500).json({ error: 'Failed to delete payment' });
+    return res.status(500).json({
+      message: "Failed to fetch invoice history",
+      error: error.message,
+    });
+  }
+};
+
+// --------------------------------------------------
+// 5. DELETE INVOICE
+// DELETE /api/invoices/:id
+//
+// This removes invoice data from a subscription but keeps
+// the subscription record. Counter resets to zero.
+// --------------------------------------------------
+
+exports.deleteInvoice = async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    if (!mongoose.isValidObjectId(id)) {
+      return res.status(400).json({
+        message: "Invalid subscription ID",
+      });
+    }
+
+    const subscription = await Subscription.findById(id);
+
+    if (!subscription) {
+      return res.status(404).json({
+        message: "Subscription not found",
+      });
+    }
+
+    if (!subscription.invoiceNo) {
+      return res.status(400).json({
+        message: "No invoice exists for this subscription",
+      });
+    }
+
+    const deletedInvoiceNo = subscription.invoiceNo;
+
+    // Clear invoice-specific fields, retaining the subscription.
+    subscription.invoiceNo = undefined;
+    subscription.paymentLinkId = undefined;
+    subscription.paymentLinkUrl = undefined;
+    subscription.invoicePaymentStatus = undefined;
+    subscription.invoiceSentAt = undefined;
+    subscription.invoiceSentTo = undefined;
+    subscription.paidAt = undefined;
+    subscription.paymentId = undefined;
+
+    await subscription.save();
+
+    // Preserve audit history; do not delete historical invoice logs.
+    await writeInvoiceLog({
+      subscription: subscription._id,
+      businessAccount: subscription.businessAccount,
+      invoiceNo: deletedInvoiceNo,
+      action: "deleted",
+      note: "Invoice removed; invoice counter reset",
+    });
+
+    // Reset counter to zero after any invoice deletion.
+    await InvoiceCounter.findOneAndUpdate(
+      { _id: "invoice" },
+      { $set: { sequence: 0 } },
+      {
+        upsert: true,
+        setDefaultsOnInsert: true,
+      }
+    );
+
+    return res.status(200).json({
+      message: "Invoice deleted and counter reset",
+      deletedInvoiceNo,
+      nextCounterValue: 0,
+      note:
+        "Existing invoice numbers are retained. " +
+        "The next generated number will use the first available BILL number.",
+    });
+  } catch (error) {
+    console.error("Delete invoice error:", error);
+
+    // Duplicate key errors can occur if old records contain duplicates
+    // or concurrent requests race. The unique index prevents silent reuse.
+    return res.status(error.code === 11000 ? 409 : 500).json({
+      message:
+        error.code === 11000
+          ? "Invoice number conflict. Please retry."
+          : "Failed to delete invoice",
+      error: error.message,
+    });
   }
 };

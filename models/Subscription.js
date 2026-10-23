@@ -1,4 +1,3 @@
-// File: models/Subscription.js
 
 const mongoose = require("mongoose");
 
@@ -6,8 +5,14 @@ const subscriptionHistorySchema = new mongoose.Schema(
   {
     previousPlanName: String,
     newPlanName: String,
-    changedBy: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
-    changedDate: { type: Date, default: Date.now },
+    changedBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+    },
+    changedDate: {
+      type: Date,
+      default: Date.now,
+    },
     note: String,
   },
   { _id: false }
@@ -20,23 +25,26 @@ const subscriptionSchema = new mongoose.Schema(
       ref: "BusinessAccount",
       required: true,
     },
+
     service: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "BrandService",
       required: true,
     },
 
-    // ✅ NEW: store the plan subdoc id so we can round-trip it
     currentPlan: {
       type: mongoose.Schema.Types.ObjectId,
       default: null,
     },
 
-    // Snapshot fields (kept so historical/plan changes remain visible)
-    planName: { type: String, required: true },
+    planName: {
+      type: String,
+      required: true,
+    },
+
     planPriceMonthly: Number,
     planPriceYearly: Number,
-    planPriceOneTime: Number, // ✅ add this (used by One Time plans)
+    planPriceOneTime: Number,
 
     billingCycle: {
       type: String,
@@ -47,9 +55,15 @@ const subscriptionSchema = new mongoose.Schema(
     amountPaid: Number,
     gstRate: Number,
     totalWithGST: Number,
+
     orderId: String,
     paymentId: String,
-    purchaseDate: { type: Date, default: Date.now },
+
+    purchaseDate: {
+      type: Date,
+      default: Date.now,
+    },
+
     renewalDate: Date,
 
     status: {
@@ -57,11 +71,66 @@ const subscriptionSchema = new mongoose.Schema(
       enum: ["active", "expired", "cancelled", "pending", "lifetime"],
       default: "active",
     },
-    autoRenew: { type: Boolean, default: true },
+
+    autoRenew: {
+      type: Boolean,
+      default: true,
+    },
+
+    // Invoice details
+    invoiceNo: {
+      type: String,
+      default: null,
+    },
+
+    invoiceSentAt: {
+      type: Date,
+      default: null,
+    },
+
+    invoiceSentTo: {
+      type: String,
+      default: null,
+    },
+
+    // Razorpay payment-link details
+    paymentLinkId: {
+      type: String,
+      default: null,
+    },
+
+    paymentLinkUrl: {
+      type: String,
+      default: null,
+    },
+
+    // Invoice payment status
+    invoicePaymentStatus: {
+      type: String,
+      enum: ["pending", "paid", "failed"],
+      default: "pending",
+    },
+
+    paidAt: {
+      type: Date,
+      default: null,
+    },
 
     history: [subscriptionHistorySchema],
   },
   { timestamps: true }
+);
+
+// Prevent duplicate invoice numbers.
+// Multiple subscriptions without an invoice number are allowed.
+subscriptionSchema.index(
+  { invoiceNo: 1 },
+  {
+    unique: true,
+    partialFilterExpression: {
+      invoiceNo: { $type: "string" },
+    },
+  }
 );
 
 module.exports = mongoose.model("Subscription", subscriptionSchema);

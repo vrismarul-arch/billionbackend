@@ -93,7 +93,7 @@ const businessAccountSchema = new mongoose.Schema(
     typeOfLead: [
       {
         type: String,
-        enum: ["Fixed client", "Revenue based client", "Vrism Product", "others"],
+        enum: ["Fixed client", "Revenue based client", "billion Product", "others"],
       },
     ],
 

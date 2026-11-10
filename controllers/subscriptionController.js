@@ -17,7 +17,7 @@ const resolvePlanFromSubscription = (subscription) => {
     );
     if (byId) return byId;
   }
-  // 2) name fallback (old records without currentPlan)
+  // 2) name fallback
   if (subscription.planName) {
     return service.plans.find((p) => p.name === subscription.planName) || null;
   }
@@ -36,7 +36,7 @@ const getAlertReceiverUserId = async (businessAccountId) => {
 };
 
 /* =====================================================================
-   CREATE
+   CREATE — GST is OPTIONAL
    ===================================================================== */
 exports.createSubscription = async (req, res) => {
   try {
@@ -60,21 +60,32 @@ exports.createSubscription = async (req, res) => {
     const plan = serviceDoc.plans.id(planId);
     if (!plan) return res.status(404).json({ message: "Plan Not Found" });
 
-    const finalGstRate = Number(gstRate) > 0 ? Number(gstRate) : 18;
+    /* ---------- GST OPTIONAL ---------- */
+    const gstProvided =
+      gstRate !== undefined &&
+      gstRate !== null &&
+      String(gstRate).trim() !== "" &&
+      Number(gstRate) > 0;
+
+    const finalGstRate = gstProvided ? Number(gstRate) : 0;
     const paid = Number(amountPaid) || 0;
-    const totalWithGST = Math.round(paid + (paid * finalGstRate) / 100);
+    const totalWithGST = gstProvided
+      ? Math.round(paid + (paid * finalGstRate) / 100)
+      : paid;
 
     let renewalDate = new Date();
     if (billingCycle === "Monthly") {
       renewalDate.setMonth(renewalDate.getMonth() + 1);
-    } else {
+    } else if (billingCycle === "Yearly") {
       renewalDate.setMonth(renewalDate.getMonth() + 12);
+    } else {
+      renewalDate = null;
     }
 
     const subscription = await Subscription.create({
       businessAccount,
       service,
-      currentPlan: plan._id,        // ✅ store plan subdoc id
+      currentPlan: plan._id,
       planName: plan.name,
       planPriceMonthly: plan.priceMonthly,
       planPriceYearly: plan.priceYearly,
@@ -125,17 +136,18 @@ exports.createSubscription = async (req, res) => {
 
 /* =====================================================================
    LIST (admin)
-   ✅ returns planId + serviceId on every row so the UI can edit
    ===================================================================== */
 exports.getAllSubscriptions = async (req, res) => {
   try {
     const data = await Subscription.find()
-      .populate("businessAccount", "businessName contactName")
+      .populate(
+        "businessAccount",
+        "businessName contactName contactNumber contactEmail"
+      )
       .populate("service", "serviceName gstRate plans")
       .sort({ createdAt: -1 })
       .lean();
 
-    // attach planId resolved from name/id
     const enriched = data.map((sub) => {
       const plan = resolvePlanFromSubscription(sub);
       return {
@@ -166,13 +178,15 @@ exports.getSubscriptionsByBusiness = async (req, res) => {
 };
 
 /* =====================================================================
-   GET one subscription (FULL — used by edit form)
-   ✅ returns everything the frontend needs to prefill the drawer
+   GET one subscription (used by edit drawer)
    ===================================================================== */
 exports.getSubscriptionById = async (req, res) => {
   try {
     const subscription = await Subscription.findById(req.params.id)
-      .populate("businessAccount", "businessName contactNumber contactEmail")
+      .populate(
+        "businessAccount",
+        "businessName contactName contactNumber contactEmail"
+      )
       .populate("service", "serviceName gstRate plans");
 
     if (!subscription) {
@@ -183,18 +197,12 @@ exports.getSubscriptionById = async (req, res) => {
 
     res.json({
       _id: subscription._id,
-
-      // ids the form needs
       businessAccountId: subscription.businessAccount?._id || null,
       serviceId: subscription.service?._id || null,
       planId: plan?._id || null,
-
-      // display helpers
       businessName: subscription.businessAccount?.businessName || null,
       serviceName: subscription.service?.serviceName || null,
       serviceGstRate: subscription.service?.gstRate ?? null,
-
-      // plan snapshot + resolved plan doc
       planName: subscription.planName,
       plan: plan
         ? {
@@ -206,7 +214,6 @@ exports.getSubscriptionById = async (req, res) => {
             features: plan.features,
           }
         : null,
-
       billingCycle: subscription.billingCycle,
       status: subscription.status,
       renewalDate: subscription.renewalDate,
@@ -215,11 +222,8 @@ exports.getSubscriptionById = async (req, res) => {
       totalWithGST: subscription.totalWithGST,
       orderId: subscription.orderId,
       paymentId: subscription.paymentId,
-
-      // original populated refs (in case frontend wants them)
       businessAccount: subscription.businessAccount,
       service: subscription.service,
-
       createdAt: subscription.createdAt,
       updatedAt: subscription.updatedAt,
     });
@@ -230,7 +234,7 @@ exports.getSubscriptionById = async (req, res) => {
 };
 
 /* =====================================================================
-   GET details (kept for backward compat — same shape as before + planId)
+   GET details (backward compat)
    ===================================================================== */
 exports.getSubscriptionDetails = async (req, res) => {
   try {
@@ -267,8 +271,7 @@ exports.getSubscriptionDetails = async (req, res) => {
 };
 
 /* =====================================================================
-   UPDATE (PUT) — used by the edit drawer
-   Accepts full payload same as create.
+   UPDATE (PUT) — GST OPTIONAL
    ===================================================================== */
 exports.updateSubscription = async (req, res) => {
   try {
@@ -287,34 +290,43 @@ exports.updateSubscription = async (req, res) => {
       return res.status(404).json({ message: "Subscription not found" });
     }
 
-    // Resolve service + plan
-    const serviceDoc = await BrandService.findById(service || subscription.service);
+    const serviceDoc = await BrandService.findById(
+      service || subscription.service
+    );
     if (!serviceDoc) return res.status(404).json({ message: "Service Not Found" });
 
     const targetPlanId = planId || subscription.currentPlan;
     const plan = serviceDoc.plans.id(targetPlanId);
     if (!plan) return res.status(404).json({ message: "Plan Not Found" });
 
-    const finalGstRate =
-      Number(gstRate) > 0
-        ? Number(gstRate)
-        : Number(serviceDoc.gstRate) > 0
-        ? Number(serviceDoc.gstRate)
-        : 18;
+    /* ---------- GST OPTIONAL ---------- */
+    const gstProvided =
+      gstRate !== undefined &&
+      gstRate !== null &&
+      String(gstRate).trim() !== "" &&
+      Number(gstRate) > 0;
+
+    const finalGstRate = gstProvided ? Number(gstRate) : 0;
 
     const paid = Number(amountPaid ?? subscription.amountPaid) || 0;
-    const totalWithGST = Math.round(paid + (paid * finalGstRate) / 100);
+    const totalWithGST = gstProvided
+      ? Math.round(paid + (paid * finalGstRate) / 100)
+      : paid;
 
     const cycle = billingCycle || subscription.billingCycle;
     let renewalDate = subscription.renewalDate || new Date();
-    // recompute renewal if cycle changed
+
     if (cycle !== subscription.billingCycle) {
-      renewalDate = new Date();
-      if (cycle === "Monthly") renewalDate.setMonth(renewalDate.getMonth() + 1);
-      else renewalDate.setMonth(renewalDate.getMonth() + 12);
+      if (cycle === "One Time") {
+        renewalDate = null;
+      } else {
+        renewalDate = new Date();
+        if (cycle === "Monthly")
+          renewalDate.setMonth(renewalDate.getMonth() + 1);
+        else renewalDate.setMonth(renewalDate.getMonth() + 12);
+      }
     }
 
-    // push history if plan name changed
     if (subscription.planName !== plan.name) {
       subscription.history.push({
         previousPlanName: subscription.planName,
@@ -323,8 +335,8 @@ exports.updateSubscription = async (req, res) => {
       });
     }
 
-    // apply updates
-    subscription.businessAccount = businessAccount || subscription.businessAccount;
+    subscription.businessAccount =
+      businessAccount || subscription.businessAccount;
     subscription.service = serviceDoc._id;
     subscription.currentPlan = plan._id;
     subscription.planName = plan.name;
@@ -340,7 +352,6 @@ exports.updateSubscription = async (req, res) => {
 
     await subscription.save();
 
-    // mirror onto the business account
     await BusinessAccount.findByIdAndUpdate(subscription.businessAccount, {
       selectedService: serviceDoc._id,
       selectedPlan: plan._id,
@@ -351,8 +362,9 @@ exports.updateSubscription = async (req, res) => {
       status: "Customer",
     });
 
-    // alert
-    const receiverId = await getAlertReceiverUserId(subscription.businessAccount);
+    const receiverId = await getAlertReceiverUserId(
+      subscription.businessAccount
+    );
     if (receiverId) {
       await sendAlert({
         userId: receiverId,
@@ -385,7 +397,8 @@ exports.updateSubscription = async (req, res) => {
 exports.deleteSubscription = async (req, res) => {
   try {
     const deleted = await Subscription.findByIdAndDelete(req.params.id);
-    if (!deleted) return res.status(404).json({ message: "Subscription not found" });
+    if (!deleted)
+      return res.status(404).json({ message: "Subscription not found" });
     res.json({ message: "Subscription deleted", _id: deleted._id });
   } catch (error) {
     res.status(500).json({ message: error.message });
@@ -393,7 +406,7 @@ exports.deleteSubscription = async (req, res) => {
 };
 
 /* =====================================================================
-   UPDATE PLAN (unchanged — kept for existing /upgrade route)
+   UPDATE PLAN (kept for existing /upgrade route)
    ===================================================================== */
 exports.updatePlan = async (req, res) => {
   try {
@@ -419,7 +432,7 @@ exports.updatePlan = async (req, res) => {
       note,
     });
 
-    subscription.currentPlan = newPlan._id; // ✅ store id
+    subscription.currentPlan = newPlan._id;
     subscription.planName = newPlan.name;
     subscription.planPriceMonthly = newPlan.priceMonthly;
     subscription.planPriceYearly = newPlan.priceYearly;
@@ -427,7 +440,9 @@ exports.updatePlan = async (req, res) => {
 
     await subscription.save();
 
-    const receiverId = await getAlertReceiverUserId(subscription.businessAccount);
+    const receiverId = await getAlertReceiverUserId(
+      subscription.businessAccount
+    );
     if (receiverId) {
       await sendAlert({
         userId: receiverId,
@@ -437,8 +452,10 @@ exports.updatePlan = async (req, res) => {
       });
     }
 
-    const updated = await Subscription.findById(subscriptionId)
-      .populate("service", "serviceName plans");
+    const updated = await Subscription.findById(subscriptionId).populate(
+      "service",
+      "serviceName plans"
+    );
 
     res.json({ message: "Plan Updated", subscription: updated });
   } catch (error) {
@@ -447,7 +464,7 @@ exports.updatePlan = async (req, res) => {
 };
 
 /* =====================================================================
-   CANCEL (unchanged)
+   CANCEL
    ===================================================================== */
 exports.cancelSubscription = async (req, res) => {
   try {
@@ -457,7 +474,8 @@ exports.cancelSubscription = async (req, res) => {
       { new: true }
     ).populate("service", "serviceName");
 
-    if (!sub) return res.status(404).json({ message: "Subscription not found" });
+    if (!sub)
+      return res.status(404).json({ message: "Subscription not found" });
 
     const receiverId = await getAlertReceiverUserId(sub.businessAccount);
     if (receiverId) {

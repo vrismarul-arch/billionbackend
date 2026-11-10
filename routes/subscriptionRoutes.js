@@ -1,39 +1,29 @@
 // File: routes/subscriptionRoutes.js
 
 const express = require("express");
-const {
-  createSubscription,
-  getSubscriptionsByBusiness,
-  updatePlan,
-  cancelSubscription,
-  getAllSubscriptions,
-  getSubscriptionDetails,
-  getSubscriptionById,
-  updateSubscription,
-  deleteSubscription,
-} = require("../controllers/subscriptionController");
-const { sendInvoice } = require("../controllers/invoiceController"); // ✅ new
-
 const router = express.Router();
+const ctrl = require("../controllers/subscriptionController");
 
-/* ---------- STATIC ROUTES FIRST ---------- */
-router.get("/all", getAllSubscriptions);
-router.post("/", createSubscription);
+/* LIST */
+router.get("/all", ctrl.getAllSubscriptions);
+router.get("/business/:id", ctrl.getSubscriptionsByBusiness);
 
-/* ---------- DYNAMIC / NESTED PATHS (more specific first) ---------- */
-router.get("/details/:id", getSubscriptionDetails);
-router.put("/upgrade/:subscriptionId", updatePlan);
-router.put("/cancel/:id", cancelSubscription);
+/* SINGLE — /item/:id must come before /:id */
+router.get("/item/:id", ctrl.getSubscriptionById);
+router.get("/details/:id", ctrl.getSubscriptionDetails);
+router.get("/:id", ctrl.getSubscriptionById);
 
-/* ---------- INVOICE (before /:id) ---------- */
-router.post("/:id/send-invoice", sendInvoice); // ✅ new
+/* CREATE */
+router.post("/", ctrl.createSubscription);
 
-/* ---------- EDIT / GET ONE ---------- */
-router.get("/item/:id", getSubscriptionById);
-router.put("/:id", updateSubscription);
-router.delete("/:id", deleteSubscription);
+/* UPDATE (edit drawer) */
+router.put("/:id", ctrl.updateSubscription);
 
-/* ---------- CATCH-ALL LAST ---------- */
-router.get("/:id", getSubscriptionsByBusiness);
+/* PLAN UPGRADE */
+router.put("/upgrade/:subscriptionId", ctrl.updatePlan);
+
+/* CANCEL / DELETE */
+router.patch("/cancel/:id", ctrl.cancelSubscription);
+router.delete("/:id", ctrl.deleteSubscription);
 
 module.exports = router;

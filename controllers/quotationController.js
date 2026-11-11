@@ -12,13 +12,16 @@ const isValidId = (id) => mongoose.isValidObjectId(id);
 const roundAmount = (value) =>
   Math.round((Number(value) + Number.EPSILON) * 100) / 100;
 
+const hasGstTypeValue = (gstType) =>
+  gstType === "intrastate" || gstType === "interstate";
+
 // Calculate totals from quotation items.
 // GST is ONLY applied when a GST type is provided.
 const calculateTotals = (items = [], gstType) => {
   let subTotal = 0;
   let tax = 0;
 
-  const hasGstType = gstType === "intrastate" || gstType === "interstate";
+  const hasGstType = hasGstTypeValue(gstType);
 
   for (const item of items) {
     const quantity = Number(item.quantity ?? 1);
@@ -97,10 +100,15 @@ const buildPayload = (body) => {
       throw new Error("Quotation items must be an array.");
     }
 
+    // When a gstType is part of this request and it is empty,
+    // force every item's GST rate to 0 so no stale rate is saved.
+    const forceNoGst =
+      payload.gstType !== undefined && !hasGstTypeValue(payload.gstType);
+
     payload.items = payload.items.map((item) => {
       const quantity = Number(item.quantity ?? 1);
       const rate = Number(item.rate ?? 0);
-      const gstRate = Number(item.gstRate ?? 0); // no default 18
+      const gstRate = forceNoGst ? 0 : Number(item.gstRate ?? 0); // no default 18
 
       if (
         !Number.isFinite(quantity) ||
@@ -126,10 +134,13 @@ const buildPayload = (body) => {
         rate,
         gstRate,
         specifications: Array.isArray(item.specifications)
-          ? item.specifications.map((spec) => ({
-              name: spec.name || "",
-              value: spec.value || "",
-            }))
+          ? item.specifications
+              .map((spec) => ({
+                name: String(spec?.name ?? "").trim(),
+                value: String(spec?.value ?? "").trim(),
+              }))
+              // drop completely empty rows
+              .filter((spec) => spec.name || spec.value)
           : [],
       };
     });

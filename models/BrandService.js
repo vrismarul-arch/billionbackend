@@ -24,7 +24,7 @@ const planSchema = new mongoose.Schema(
     name: { type: String, required: true }, // Basic, Premium etc.
     priceMonthly: { type: Number, default: 0 },
     priceYearly: { type: Number, default: 0 },
-    priceOneTime: { type: Number, default: 0 }, 
+    priceOneTime: { type: Number, default: 0 },
     scriptBased: { type: Boolean, default: false },
     features: [planFeatureSchema],
     isActive: { type: Boolean, default: true },
@@ -42,9 +42,10 @@ const brandServiceSchema = new mongoose.Schema(
     basePrice: Number,
     options: [],
     notes: [noteSchema],
-    plans: [planSchema], // 🚀 main update
+    plans: [planSchema],
     isActive: { type: Boolean, default: true },
     gstRate: { type: Number, default: 18 },
+    order: { type: Number, default: 0, index: true }, // drag & drop position
   },
   { timestamps: true }
 );
